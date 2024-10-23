@@ -264,7 +264,7 @@ class VoIPCall:
         )
         return self.gen_ms()
 
-    def gen_ms(self) -> Dict[int, Dict[int, RTP.PayloadType]]:
+    def gen_ms(self, start=True) -> Dict[int, Dict[int, RTP.PayloadType]]:
         """
         Generate m SDP attribute for answering originally and
         for re-negotiations.
@@ -273,19 +273,21 @@ class VoIPCall:
         # and more bindings it will cause duplicate RTP-Clients to spawn.
         m = {}
         for x in self.RTPClients:
-            x.start()
+            if start:
+                x.start()
             m[x.inPort] = x.assoc
 
         return m
 
     def renegotiate(self, request: SIP.SIPMessage) -> None:
-        m = self.gen_ms()
+        m = self.gen_ms(start=False)
         message = self.sip.gen_answer(
             request, self.session_id, m, self.sendmode
         )
         self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
+            message.encode("utf8"), (self.phone.nexthop(), self.phone.nextport())
         )
+        return
         for i in request.body["m"]:
             if i["type"] == "video":  # Disable Video
                 continue
@@ -303,7 +305,7 @@ class VoIPCall:
             self.request, self.session_id, m, self.sendmode
         )
         self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
+            message.encode("utf8"), (self.phone.nexthop(), self.phone.nextport())
         )
         self.state = CallState.ANSWERED
 
@@ -342,6 +344,8 @@ class VoIPCall:
             x.start()
         self.request.headers["Contact"] = request.headers["Contact"]
         self.request.headers["To"]["tag"] = request.headers["To"]["tag"]
+        if "Record-Route" in request.headers:
+            self.request.headers["Record-Route"] = request.headers["Record-Route"]
         self.state = CallState.ANSWERED
 
     def notFound(self, request: SIP.SIPMessage) -> None:
@@ -402,12 +406,36 @@ class VoIPCall:
         # also resets all other warnings.
         warnings.simplefilter("default")
 
+    def other(self, request: SIP.SIPMessage) -> None:
+        if self.state != CallState.DIALING:
+            debug(
+                "TODO: 500 Error, received an unavailable response for a "
+                + f"call not in the dailing state.  Call: {self.call_id}, "
+                + f"Call State: {self.state}"
+            )
+            return
+
+        for x in self.RTPClients:
+            x.stop()
+        self.state = CallState.ENDED
+        del self.phone.calls[self.request.headers["Call-ID"]]
+        debug("Call terminated")
+        warnings.warn(
+            f"The number '{request.headers['To']['number']}' "
+            + "was unavailable.  CallState set to CallState.ENDED.",
+            stacklevel=20,
+        )
+        # Resets the warning filter so this warning will
+        # come up again if it happens.  However, this
+        # also resets all other warnings.
+        warnings.simplefilter("default")
+
     def deny(self) -> None:
         if self.state != CallState.RINGING:
             raise InvalidStateError("Call is not ringing")
         message = self.sip.gen_busy(self.request)
         self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
+            message.encode("utf8"), (self.phone.nexthop(), self.phone.nextport())
         )
         for x in self.RTPClients:
             x.stop()
@@ -466,6 +494,10 @@ class VoIPCall:
             nd = audioop.add(nd, d, 1)
         return nd
 
+    def reset_rtp_recv_buffer(self):
+        for rtp in self.RTPClients:
+            rtp.reset_recv_buffer()
+
 
 class VoIPPhone:
     def __init__(
@@ -479,6 +511,7 @@ class VoIPPhone:
         sipPort=5060,
         rtpPortLow=10000,
         rtpPortHigh=20000,
+        outbound_proxy=tuple(),
     ):
         if rtpPortLow > rtpPortHigh:
             raise InvalidRangeError("'rtpPortHigh' must be >= 'rtpPortLow'")
@@ -496,6 +529,7 @@ class VoIPPhone:
         self.myIP = myIP
         self.username = username
         self.password = password
+        self.outbound_proxy = outbound_proxy
         self.callCallback = callCallback
         self._status = PhoneStatus.INACTIVE
 
@@ -517,7 +551,18 @@ class VoIPPhone:
             myPort=sipPort,
             callCallback=self.callback,
             fatalCallback=self.fatal,
+            outbound_proxy=self.outbound_proxy
         )
+
+    def nexthop(self):
+        if self.outbound_proxy:
+            return self.outbound_proxy[0]
+        return self.server
+
+    def nextport(self):
+        if self.outbound_proxy:
+            return self.outbound_proxy[1]
+        return self.port
 
     def callback(self, request: SIP.SIPMessage) -> None:
         # debug("Callback: "+request.summary())
@@ -534,6 +579,8 @@ class VoIPPhone:
                 self._callback_RESP_NotFound(request)
             elif request.status == SIP.SIPStatus.SERVICE_UNAVAILABLE:
                 self._callback_RESP_Unavailable(request)
+            else:
+                self._callback_RESP_Other(request)
 
     def getStatus(self) -> PhoneStatus:
         warnings.warn(
@@ -564,7 +611,7 @@ class VoIPPhone:
         if self.callCallback is None:
             message = self.sip.gen_busy(request)
             self.sip.out.sendto(
-                message.encode("utf8"), (self.server, self.port)
+                message.encode("utf8"), (self.nexthop(), self.nextport())
             )
         else:
             debug("New call!")
@@ -576,7 +623,7 @@ class VoIPPhone:
                     sess_id = proposed
             message = self.sip.gen_ringing(request)
             self.sip.out.sendto(
-                message.encode("utf8"), (self.server, self.port)
+                message.encode("utf8"), (self.nexthop(), self.nextport())
             )
             self._create_Call(request, sess_id)
             try:
@@ -588,7 +635,7 @@ class VoIPPhone:
             except Exception:
                 message = self.sip.gen_busy(request)
                 self.sip.out.sendto(
-                    message.encode("utf8"), (self.server, self.port)
+                    message.encode("utf8"), (self.nexthop(), self.nextport())
                 )
                 raise
 
@@ -610,7 +657,13 @@ class VoIPPhone:
         self.calls[call_id].answered(request)
         debug("Answered")
         ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self.sip.out.sendto(ack.encode("utf8"), (self.nexthop(), self.nextport()))
+        if self.callCallback:
+            t = Timer(1, self.callCallback, [self.calls[call_id]])
+            t.name = f"Phone Call: {call_id}"
+            t.start()
+            self.threads.append(t)
+            self.threadLookup[t] = call_id
 
     def _callback_RESP_NotFound(self, request: SIP.SIPMessage) -> None:
         debug("Not Found recieved, invalid number called?")
@@ -624,7 +677,7 @@ class VoIPPhone:
         self.calls[call_id].not_found(request)
         debug("Terminating Call")
         ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self.sip.out.sendto(ack.encode("utf8"), (self.nexthop(), self.nextport()))
 
     def _callback_RESP_Unavailable(self, request: SIP.SIPMessage) -> None:
         debug("Service Unavailable recieved")
@@ -638,7 +691,18 @@ class VoIPPhone:
         self.calls[call_id].unavailable(request)
         debug("Terminating Call")
         ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self.sip.out.sendto(ack.encode("utf8"), (self.nexthop(), self.nextport()))
+
+    def _callback_RESP_Other(self, request: SIP.SIPMessage) -> None:
+        debug("Service Other recieved")
+        call_id = request.headers["Call-ID"]
+        if call_id in self.calls:
+            self.calls[call_id].other(request)
+        else:
+            debug("Unkown call")
+        debug("Terminating Call")
+        ack = self.sip.gen_ack(request)
+        self.sip.out.sendto(ack.encode("utf8"), (self.nexthop(), self.nextport()))
 
     def _create_Call(self, request: SIP.SIPMessage, sess_id: int) -> None:
         """

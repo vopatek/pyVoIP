@@ -216,6 +216,26 @@ class RTPPacketManager:
         self.bufferLock.release()
 
 
+class RTPBufferingPacketManager:
+    def __init__(self):
+        self.buffer = b''
+        self.bufferLock = threading.Lock()
+
+    def reset(self):
+        with self.bufferLock:
+            self.buffer = b''
+
+    def read(self, length: int = 160) -> bytes:
+        with self.bufferLock:
+            packet = self.buffer[0:length]
+            self.buffer = self.buffer[length:]
+        return packet
+
+    def write(self, offset: int, data: bytes) -> None:
+        with self.bufferLock:
+            self.buffer += data
+
+
 class RTPMessage:
     def __init__(self, data: bytes, assoc: Dict[int, PayloadType]):
         self.RTPCompatibleVersions = pyVoIP.RTPCompatibleVersions
@@ -327,7 +347,7 @@ class RTPClient:
         self.dtmf = dtmf
 
         self.pmout = RTPPacketManager()  # To Send
-        self.pmin = RTPPacketManager()  # Received
+        self.pmin = RTPBufferingPacketManager()  # Received
         self.outOffset = random.randint(1, 5000)
 
         self.outSequence = random.randint(1, 100)
@@ -354,11 +374,14 @@ class RTPClient:
         self.sin.close()
         self.sout.close()
 
+    def reset_recv_buffer(self):
+        self.pmin.reset()
+
     def read(self, length: int = 160, blocking: bool = True) -> bytes:
         if not blocking:
             return self.pmin.read(length)
         packet = self.pmin.read(length)
-        while packet == (b"\x80" * length) and self.NSD:
+        while len(packet) == 0 and self.NSD:
             time.sleep(0.01)
             packet = self.pmin.read(length)
         return packet
